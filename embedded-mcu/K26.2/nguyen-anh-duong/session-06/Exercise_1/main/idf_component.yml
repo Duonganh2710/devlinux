@@ -1,0 +1,6 @@
+## Component manager dependencies for LVGL UI
+## LVGL v8.3 + official Espressif LVGL port (works with ESP-IDF 5.2 / esp32s3)
+dependencies:
+  lvgl/lvgl: "^8.3.0"
+  espressif/esp_lvgl_port: "^1.1.0"
+  idf: ">=5.0"
