@@ -43,6 +43,7 @@ static volatile int64_t last_press;
 
 static void IRAM_ATTR btn_isr(void *arg)
 {
+    (void)arg;
     int64_t now = esp_timer_get_time();
     if (now - last_press > 50000) {      // ignore anything within 50 ms (bounce)
         last_press = now;
@@ -110,7 +111,7 @@ static void set_duty(uint32_t duty)
 
 static uint32_t read_pot(void)
 {
-    int raw;
+    int raw = 0;
     uint32_t sum = 0;
     for (int i = 0; i < NSAMPLES; i++) {
         adc_oneshot_read(adc, ADC_CHANNEL_0, &raw);
@@ -136,33 +137,27 @@ void app_main(void)
 
             if (breathe) {
                 up = true;
-                ledc_set_fade_with_time(LEDC_MODE, LEDC_CH, DUTY_MAX, FADE_MS);
-                ledc_fade_start(LEDC_MODE, LEDC_CH, LEDC_FADE_NO_WAIT);
-                ESP_LOGI(TAG, "mode=BREATHE  fade up   -> %u over %d ms",
-                         DUTY_MAX, FADE_MS);
             } else {
-                ledc_fade_stop(LEDC_MODE, LEDC_CH);
                 ESP_LOGI(TAG, "mode=KNOB");
             }
         }
 
         if (breathe) {
-            // the peripheral ramps the duty itself, we only wait for it to end.
-            // NO_WAIT lets us keep polling so a press during the fade isn't lost
-            if (!ledc_fade_is_running(LEDC_MODE, LEDC_CH)) {
-                up = !up;
-                uint32_t target = up ? DUTY_MAX : 0;
-                ledc_set_fade_with_time(LEDC_MODE, LEDC_CH, target, FADE_MS);
-                ledc_fade_start(LEDC_MODE, LEDC_CH, LEDC_FADE_NO_WAIT);
-                ESP_LOGI(TAG, "mode=BREATHE  fade %s -> %u over %d ms",
-                         up ? "up  " : "down", target, FADE_MS);
-            }
-            vTaskDelay(pdMS_TO_TICKS(20));
+            // hand the whole ramp to the LEDC peripheral. WAIT_DONE blocks this
+            // task (it sleeps, CPU idle) until the fade finishes, so we never
+            // compute intermediate duties ourselves. A press during the fade is
+            // kept in btn_pressed and picked up on the next loop.
+            uint32_t target = up ? DUTY_MAX : 0;
+            ledc_set_fade_with_time(LEDC_MODE, LEDC_CH, target, FADE_MS);
+            ESP_LOGI(TAG, "mode=BREATHE  fade %s -> %u over %d ms",
+                     up ? "up  " : "down", (unsigned)target, FADE_MS);
+            ledc_fade_start(LEDC_MODE, LEDC_CH, LEDC_FADE_WAIT_DONE);
+            up = !up;
         } else {
             uint32_t raw = read_pot();
             uint32_t duty = (uint32_t)((uint64_t)raw * DUTY_MAX / ADC_MAX);
             set_duty(duty);
-            ESP_LOGI(TAG, "mode=KNOB  raw=%u  duty=%u", raw, duty);
+            ESP_LOGI(TAG, "mode=KNOB  raw=%u  duty=%u", (unsigned)raw, (unsigned)duty);
             vTaskDelay(pdMS_TO_TICKS(150));
         }
     }
