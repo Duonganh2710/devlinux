@@ -1,6 +1,7 @@
 #include "driver/gpio.h"
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 #include "esp_timer.h"
 #include "freertos/task.h"
 #include <stdbool.h>
@@ -30,7 +31,6 @@ typedef struct
     bool is_press;
 } btn_event_t;
 
-//static volatile bool button_status = false;
 static QueueHandle_t btn_queue = NULL;
 // Common-cathode map: bits b0 to b6 represent segments a to g.
 static const uint8_t segment_map[10] = {
@@ -54,15 +54,28 @@ static void set_display_seven_segment(int value) {
   gpio_set_level(SEVEN_SEGMENT_DP_GPIO, 1);
 }
 
-// Send a button event to the queue when the button is pressed.
+// Queue debounced button edges for processing in task context.
 static void IRAM_ATTR gpio_button_isr_handler(void *arg) {
-  //button_status = (gpio_get_level(BUTTON_GPIO) == 0);
+  static int64_t last_edge_time_us = 0;
+  int64_t timestamp_us = esp_timer_get_time();
+
+  if (last_edge_time_us != 0 &&
+      timestamp_us - last_edge_time_us < (int64_t)DEBOUNCE_MS * 1000) {
+    return;
+  }
+
   btn_event_t event = {
-        .timestamp_us = esp_timer_get_time(),
+        .timestamp_us = timestamp_us,
         .is_press = (gpio_get_level(BUTTON_GPIO) == 0)
     };
 
-    xQueueSend(btn_queue, &event, 0);
+  BaseType_t higher_priority_task_woken = pdFALSE;
+  if (xQueueSendFromISR(btn_queue, &event, &higher_priority_task_woken) == pdTRUE) {
+    last_edge_time_us = timestamp_us;
+    if (higher_priority_task_woken == pdTRUE) {
+      portYIELD_FROM_ISR();
+    }
+  }
 }
 
 static void gpio_init(void) {
@@ -104,109 +117,111 @@ static void gpio_init(void) {
 
 static void event_task(void *arg)
 {
-    int64_t previous_time_ms = 0;
-    int64_t current_time_ms = 0;
-
-    int64_t current_time_count_long_click_ms = 0;
-    int64_t previous_time_count_long_click_ms = 0;
-    int64_t first_time_count_long_click_ms = 0;
-
     int display_number = 0;
-    bool long_click = false; 
-    bool single_click = false; 
+    bool button_down = false;
+    bool long_press_started = false;
+    bool click_pending = false;
+    bool double_click_candidate = false;
+    int64_t press_started_ms = 0;
+    int64_t first_release_ms = 0;
+    int64_t next_repeat_ms = 0;
 
     btn_event_t event;
-    while(1)
-    {
-        if (xQueueReceive(btn_queue, &event, pdMS_TO_TICKS(DEBOUNCE_MS)) == pdTRUE)
-        {
-
-            if (event.is_press)
-            {
-                previous_time_ms = current_time_ms;
-                current_time_ms = event.timestamp_us / 1000;
-                long_click = true;
-
-                current_time_count_long_click_ms = 0;
-                previous_time_count_long_click_ms = 0;
-                first_time_count_long_click_ms = 0;
-            }
-            else 
-            {
-                long_click = false;
-                current_time_count_long_click_ms = 0;
-                previous_time_count_long_click_ms = 0;
-                first_time_count_long_click_ms = 0;
-
-                if(current_time_ms != 0 && previous_time_ms == 0) 
-                {
-                    if(event.timestamp_us / 1000 - current_time_ms >= DOUBLE_CLICK_MS){
-                        // SINGLE CLICK → +1
-                        display_number = (display_number + 1) % sizeof(segment_map);
-                        set_display_seven_segment(display_number);
-
-                        current_time_ms = 0;
-                        previous_time_ms = 0;
-                        single_click = false;
-                    }else{
-                            single_click = true;
-                    }
-                    
-                }
-                else if(current_time_ms != 0 && previous_time_ms != 0){
-                    if(((event.timestamp_us / 1000) - previous_time_ms) <= DOUBLE_CLICK_MS)
-                    {
-                        //printf("value: %lld\n", event.timestamp_us / 1000 -  previous_time_ms );
-                        // DOUBLE CLICK → -1
-                        display_number =
-                            (display_number + sizeof(segment_map) - 1)
-                            % sizeof(segment_map);
-
-                        set_display_seven_segment(display_number);
-
-                        current_time_ms = 0;
-                        previous_time_ms = 0;
-
-                    }  
-                }
+    while (1) {
+        int64_t now_ms = esp_timer_get_time() / 1000;
+        int64_t wait_ms = REPEAT_PERIOD_MS;
+        if (button_down) {
+            int64_t deadline_ms = long_press_started
+                ? next_repeat_ms
+                : press_started_ms + LONG_PRESS_MS;
+            if (deadline_ms - now_ms < wait_ms) {
+                wait_ms = deadline_ms - now_ms;
             }
         }
+        if (click_pending &&
+            first_release_ms + DOUBLE_CLICK_MS - now_ms < wait_ms) {
+            wait_ms = first_release_ms + DOUBLE_CLICK_MS - now_ms;
+        }
+        if (wait_ms < 1) {
+            wait_ms = 1;
+        }
 
-        if(long_click)
-        {
-            if(first_time_count_long_click_ms == 0)
-            {
-                first_time_count_long_click_ms = esp_timer_get_time() / 1000;
-            }
-            current_time_count_long_click_ms = esp_timer_get_time() / 1000;
+        TickType_t wait_ticks = pdMS_TO_TICKS(wait_ms);
+        if (wait_ticks == 0) {
+            wait_ticks = 1;
+        }
 
-            if(current_time_count_long_click_ms -  first_time_count_long_click_ms >= LONG_PRESS_MS && 
-                current_time_count_long_click_ms - previous_time_count_long_click_ms >= REPEAT_PERIOD_MS)
-            {
+        bool event_received =
+            xQueueReceive(btn_queue, &event, wait_ticks) == pdTRUE;
+        int64_t timer_now_ms = event_received
+            ? event.timestamp_us / 1000
+            : esp_timer_get_time() / 1000;
+
+        if (click_pending &&
+            timer_now_ms - first_release_ms > DOUBLE_CLICK_MS) {
+            click_pending = false;
+        }
+
+        if (button_down) {
+            if (!long_press_started &&
+                timer_now_ms - press_started_ms >= LONG_PRESS_MS) {
                 display_number = (display_number + 1) % sizeof(segment_map);
                 set_display_seven_segment(display_number);
-
-                previous_time_count_long_click_ms = current_time_count_long_click_ms;
+                long_press_started = true;
+                next_repeat_ms = press_started_ms + LONG_PRESS_MS + REPEAT_PERIOD_MS;
             }
-        }
 
-        if(single_click)
-        {
-            if(esp_timer_get_time() / 1000 - current_time_ms > DOUBLE_CLICK_MS 
-            &&  esp_timer_get_time() / 1000 - current_time_ms < LONG_PRESS_MS)
-            {
+            while (long_press_started && timer_now_ms >= next_repeat_ms) {
                 display_number = (display_number + 1) % sizeof(segment_map);
-                    set_display_seven_segment(display_number);
-
-                single_click = false;
-                current_time_ms = 0;
-                previous_time_ms = 0;
+                set_display_seven_segment(display_number);
+                next_repeat_ms += REPEAT_PERIOD_MS;
             }
-
-            printf("value: %lld\n", esp_timer_get_time() / 1000 - current_time_ms );
         }
 
-        vTaskDelay(pdMS_TO_TICKS(DEBOUNCE_MS));
+        if (event_received) {
+            int64_t event_time_ms = event.timestamp_us / 1000;
+
+            if (event.is_press) {
+                if (!button_down) {
+                    if (click_pending) {
+                        if (event_time_ms - first_release_ms <= DOUBLE_CLICK_MS) {
+                            // Undo the first click's immediate increment.
+                            display_number =
+                                (display_number + sizeof(segment_map) - 1) % sizeof(segment_map);
+                            set_display_seven_segment(display_number);
+                            double_click_candidate = true;
+                            click_pending = false;
+                        } else {
+                            click_pending = false;
+                            double_click_candidate = false;
+                        }
+                    }
+
+                    button_down = true;
+                    press_started_ms = event_time_ms;
+                    long_press_started = false;
+                }
+            } else if (button_down) {
+                bool was_long_press = long_press_started;
+                button_down = false;
+                long_press_started = false;
+
+                if (double_click_candidate && !was_long_press) {
+                    display_number =
+                        (display_number + sizeof(segment_map) - 1) % sizeof(segment_map);
+                    set_display_seven_segment(display_number);
+                    double_click_candidate = false;
+                } else if (!was_long_press) {
+                    display_number = (display_number + 1) % sizeof(segment_map);
+                    set_display_seven_segment(display_number);
+                    click_pending = true;
+                    first_release_ms = event_time_ms;
+                    double_click_candidate = false;
+                } else {
+                    double_click_candidate = false;
+                }
+            }
+        }
     }
 }
 
